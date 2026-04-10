@@ -885,6 +885,46 @@ static void mj_advance(const mjModel* m, mjData* d,
     for (int i=0; i < nu; i++) {
       int actadr = m->actuator_actadr[i];
       int actadr_end = actadr + m->actuator_actnum[i];
+
+      // back-EMF ctrl correction for filterexact with dynprm[1,2] set
+      if (m->actuator_dyntype[i] == mjDYN_FILTEREXACT && !mj_actuatorDisabled(m, i)) {
+        const mjtNum* dynprm = m->actuator_dynprm + i * mjNDYN;
+        mjtNum tau_e = mju_max(mjMINVAL, dynprm[0]);
+        mjtNum Ke_gr = dynprm[1];
+        mjtNum L_val = dynprm[2];
+
+        if (Ke_gr != 0 && L_val > 0) {
+          mjtNum dt = m->opt.timestep;
+          mjtNum R_val = L_val / tau_e;
+
+          // J·qacc sparse dot product
+          mjtNum Jqacc = 0;
+          int nnz = d->moment_rownnz[i];
+          int adr = d->moment_rowadr[i];
+          for (int k = 0; k < nnz; k++) {
+            Jqacc += d->actuator_moment[adr + k] * qacc[d->moment_colind[adr + k]];
+          }
+
+          // ctrl was computed with omega_old, correct for omega_new
+          mjtNum ctrl_eff = d->ctrl[i] - Ke_gr * dt * Jqacc / R_val;
+          int act_last = actadr + m->actuator_actnum[i] - 1;
+          mjtNum act_i = d->act[act_last];
+          mjtNum act_dot_corr = (ctrl_eff - act_i) / tau_e;
+
+          // exact integration
+          mjtNum act_new = act_i + act_dot_corr * tau_e * (1.0 - mju_exp(-dt / tau_e));
+
+          // clamp to actrange
+          if (m->actuator_actlimited[i]) {
+            mjtNum* actrange = m->actuator_actrange + 2 * i;
+            act_new = mju_clip(act_new, actrange[0], actrange[1]);
+          }
+
+          d->act[act_last] = act_new;
+          continue;
+        }
+      }
+
       for (int j=actadr; j < actadr_end; j++) {
         // if disabled, set act_dot to 0
         d->act[j] = mj_nextActivation(m, d, i, j, mj_actuatorDisabled(m, i) ? 0 : act_dot[j]);

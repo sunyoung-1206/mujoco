@@ -1143,6 +1143,25 @@ void mjd_actuator_vel(const mjModel* m, mjData* d) {
       addJTBJSparse(m, d, d->actuator_moment, &bias_vel, 1, i,
                     d->moment_rownnz, d->moment_rowadr, d->moment_colind);
     }
+
+    // Schur complement for back-EMF cross-coupling (filterexact with dynprm[1,2] set)
+    // Activated when dyntype=filterexact AND dynprm[1]=Ke*gr>0 AND dynprm[2]=L>0
+    if (m->actuator_dyntype[i] == mjDYN_FILTEREXACT) {
+      const mjtNum* dynprm = m->actuator_dynprm + i * mjNDYN;
+      mjtNum tau_e = mju_max(mjMINVAL, dynprm[0]);
+      mjtNum Ke_gr = dynprm[1];
+      mjtNum L_val = dynprm[2];
+
+      if (Ke_gr != 0 && L_val > 0) {
+        mjtNum Kt_gr = (m->actuator_gainprm + mjNGAIN * i)[0];
+        mjtNum dt = m->opt.timestep;
+        mjtNum d_inv = 1.0 / (1.0 + dt / tau_e);
+        mjtNum schur_scale = dt * dt * Kt_gr * Ke_gr / L_val * d_inv;
+
+        addJTBJSparse(m, d, d->actuator_moment, &schur_scale, 1, i,
+                      d->moment_rownnz, d->moment_rowadr, d->moment_colind);
+      }
+    }
   }
 }
 
