@@ -482,6 +482,36 @@ void mj_fwdActuation(const mjModel* m, mjData* d) {
 
     // add bias
     force[i] += bias;
+
+    // RHS correction for coupled back-EMF (Schur complement RHS)
+    // MuJoCo filterexact: I_new = β·I_old + (1-β)·ctrl, where ctrl = I_ss = (V-Ke·ω)/R
+    // I_predicted = β·I_old + (1-β)·ctrl  (filterexact at current ω)
+    // ΔF = Kt·(I_predicted - I_old) = Kt·(1-β)·(ctrl - I_old)
+    //
+    // Method A+: β = exp(-h/τ)    (filterexact)
+    // Method A:  β = 1/(1+h/τ)    (implicit Euler)
+    if (m->actuator_dyntype[i] == mjDYN_FILTEREXACT && m->actuator_actadr[i] >= 0) {
+      const mjtNum* dynprm_i = m->actuator_dynprm + i * mjNDYN;
+      mjtNum tau_e_i = mju_max(mjMINVAL, dynprm_i[0]);
+      mjtNum Ke_gr_i = dynprm_i[1];
+      mjtNum L_val_i = dynprm_i[2];
+
+      if (Ke_gr_i != 0 && L_val_i > 0) {
+        mjtNum dt_i = m->opt.timestep;
+        // dynprm[3] > 0 → A+ (filterexact), else → A (implicit Euler)
+        mjtNum beta_i = (dynprm_i[3] > 0) ? mju_exp(-dt_i / tau_e_i)
+                                           : 1.0 / (1.0 + dt_i / tau_e_i);
+
+        int act_adr_i = m->actuator_actadr[i] + m->actuator_actnum[i] - 1;
+        mjtNum I_old = d->act[act_adr_i];
+        mjtNum ctrl_i = d->ctrl[i];  // = I_ss = (V - Ke·ω)/R
+        mjtNum Kt_gr_i = (m->actuator_gainprm + mjNGAIN * i)[0];
+
+        // ΔF = Kt · (1-β) · (I_ss - I_old)
+        mjtNum deltaF = Kt_gr_i * (1.0 - beta_i) * (ctrl_i - I_old);
+        force[i] += deltaF;
+      }
+    }
   }
 
   // handle actuator plugins

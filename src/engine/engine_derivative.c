@@ -1155,8 +1155,14 @@ void mjd_actuator_vel(const mjModel* m, mjData* d) {
       if (Ke_gr != 0 && L_val > 0) {
         mjtNum Kt_gr = (m->actuator_gainprm + mjNGAIN * i)[0];
         mjtNum dt = m->opt.timestep;
-        mjtNum d_inv = 1.0 / (1.0 + dt / tau_e);
-        mjtNum schur_scale = dt * dt * Kt_gr * Ke_gr / L_val * d_inv;
+        mjtNum R_val = L_val / tau_e;  // motor resistance
+
+        // Schur complement: ∂(Kt·I_new)/∂ω = Kt·(1-β)·(-Ke/R) < 0  (damping)
+        // dynprm[3] > 0 → A+ (filterexact: β = exp(-h/τ))
+        // dynprm[3] = 0 → A  (implicit Euler: β = 1/(1+h/τ))
+        mjtNum beta = (dynprm[3] > 0) ? mju_exp(-dt / tau_e)
+                                       : 1.0 / (1.0 + dt / tau_e);
+        mjtNum schur_scale = -(1.0 - beta) * Kt_gr * Ke_gr / R_val;
 
         addJTBJSparse(m, d, d->actuator_moment, &schur_scale, 1, i,
                       d->moment_rownnz, d->moment_rowadr, d->moment_colind);
