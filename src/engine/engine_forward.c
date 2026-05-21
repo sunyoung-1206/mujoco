@@ -345,9 +345,30 @@ void mj_fwdActuation(const mjModel* m, mjData* d) {
       break;
 
     case mjDYN_FILTER:              // linear filter: prm = tau
-    case mjDYN_FILTEREXACT:
       tau = mju_max(mjMINVAL, prm[0]);
       d->act_dot[act_last] = (ctrl[i] - d->act[act_last]) / tau;
+      break;
+
+    case mjDYN_FILTEREXACT:
+      // Coupled filterexact: standard filter + Ke mismatch correction (demag).
+      //   dI/dt = (ctrl - act) / tau  +  (Ke_nom*gr - Ke_plant*gr) * omega / L
+      // Slots: dynprm[0]=tau=L/R, [1]=Ke_plant*gr, [2]=L, [3]=Ke_nom*gr.
+      // Healthy: dynprm[3]==dynprm[1] -> correction=0 -> vanilla behaviour.
+      // Mirrors mjwarp/_src/forward.py:679-693.
+      tau = mju_max(mjMINVAL, prm[0]);
+      d->act_dot[act_last] = (ctrl[i] - d->act[act_last]) / tau;
+      {
+        mjtNum Ke_plant_gr = prm[1];
+        mjtNum L_val = prm[2];
+        if (Ke_plant_gr != 0 && L_val > 0) {
+          int joint_id = m->actuator_trnid[2 * i];
+          if (joint_id >= 0) {
+            int dof_adr = m->jnt_dofadr[joint_id];
+            mjtNum omega = d->qvel[dof_adr];
+            d->act_dot[act_last] += (prm[3] - prm[1]) * omega / L_val;
+          }
+        }
+      }
       break;
 
     case mjDYN_MUSCLE:              // muscle model: prm = (tau_act, tau_deact)
@@ -498,9 +519,11 @@ void mj_fwdActuation(const mjModel* m, mjData* d) {
 
       if (Ke_gr_i != 0 && L_val_i > 0) {
         mjtNum dt_i = m->opt.timestep;
-        // dynprm[3] > 0 → A+ (filterexact), else → A (implicit Euler)
-        mjtNum beta_i = (dynprm_i[3] > 0) ? mju_exp(-dt_i / tau_e_i)
-                                           : 1.0 / (1.0 + dt_i / tau_e_i);
+        // dynprm[4] = 0 → A IE  (β = 1/(1+h/τ))
+        // dynprm[4] > 0 → A+   (β = exp(-h/τ))
+        mjtNum beta_i = (dynprm_i[4] > 0)
+                        ? mju_exp(-dt_i / tau_e_i)
+                        : 1.0 / (1.0 + dt_i / tau_e_i);
 
         int act_adr_i = m->actuator_actadr[i] + m->actuator_actnum[i] - 1;
         mjtNum I_old = d->act[act_adr_i];
@@ -916,7 +939,12 @@ static void mj_advance(const mjModel* m, mjData* d,
       int actadr = m->actuator_actadr[i];
       int actadr_end = actadr + m->actuator_actnum[i];
 
-      // back-EMF ctrl correction for filterexact with dynprm[1,2] set
+      // Method A / A+ integrator for FILTEREXACT motor coupling.
+      // Detection: dynprm[1]=Ke·gr != 0 AND dynprm[2]=L > 0.
+      // dynprm[4] = 0 → A IE  : act_new = act + h * act_dot / (1 + h/τ)
+      // dynprm[4] > 0 → A+    : act_new = act + τ * act_dot * (1 - exp(-h/τ))
+      // Note: cross-Jacobian back-EMF coupling is handled by the Schur term
+      // in engine_derivative.c, not here. This block only does the act integration.
       if (m->actuator_dyntype[i] == mjDYN_FILTEREXACT && !mj_actuatorDisabled(m, i)) {
         const mjtNum* dynprm = m->actuator_dynprm + i * mjNDYN;
         mjtNum tau_e = mju_max(mjMINVAL, dynprm[0]);
@@ -925,24 +953,18 @@ static void mj_advance(const mjModel* m, mjData* d,
 
         if (Ke_gr != 0 && L_val > 0) {
           mjtNum dt = m->opt.timestep;
-          mjtNum R_val = L_val / tau_e;
-
-          // J·qacc sparse dot product
-          mjtNum Jqacc = 0;
-          int nnz = d->moment_rownnz[i];
-          int adr = d->moment_rowadr[i];
-          for (int k = 0; k < nnz; k++) {
-            Jqacc += d->actuator_moment[adr + k] * qacc[d->moment_colind[adr + k]];
-          }
-
-          // ctrl was computed with omega_old, correct for omega_new
-          mjtNum ctrl_eff = d->ctrl[i] - Ke_gr * dt * Jqacc / R_val;
           int act_last = actadr + m->actuator_actnum[i] - 1;
           mjtNum act_i = d->act[act_last];
-          mjtNum act_dot_corr = (ctrl_eff - act_i) / tau_e;
+          mjtNum act_dot_i = d->act_dot[act_last];
 
-          // exact integration
-          mjtNum act_new = act_i + act_dot_corr * tau_e * (1.0 - mju_exp(-dt / tau_e));
+          mjtNum act_new;
+          if (dynprm[4] > 0) {
+            // A+: τ · (1 - exp(-h/τ))
+            act_new = act_i + tau_e * act_dot_i * (1.0 - mju_exp(-dt / tau_e));
+          } else {
+            // A IE: h / (1 + h/τ)
+            act_new = act_i + dt * act_dot_i / (1.0 + dt / tau_e);
+          }
 
           // clamp to actrange
           if (m->actuator_actlimited[i]) {
